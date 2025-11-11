@@ -4,7 +4,13 @@ With the introduction of `go test -json` in go 1.10, it's finally
 possible to make reasonable front-ends for running go tests, and emacs
 is right here at the vanguard! This is, at heart, a mode for running
 `go test`, and it does a bunch of things better than just running them
-on the console. `gotest-ui-mode`:
+on the console.
+
+With the release of `-fullpath` in go 1.21, it's possible to actually
+make the filenames reliably find-able, so this fork requires that
+version or greater.
+
+`gotest-ui-mode`:
 
 * Shows the overall test status - `pass` or `fail` for the entire
   suite is displayed on the first line.
