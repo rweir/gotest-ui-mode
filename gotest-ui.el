@@ -77,8 +77,9 @@ Whenever a test enters this state, it is automatically expanded."
   :group 'gotest-ui
   :type '(repeat string))
 
-(defcustom gotest-ui-test-args '("test" "-json")
-  "Argument list used to run tests with JSON output."
+(defcustom gotest-ui-test-args '("test" "-json" "-fullpath")
+  "Argument list used to run tests with JSON output.
+The -fullpath flag (Go 1.21+) ensures test output includes absolute file paths."
   :group 'gotest-ui
   :type '(repeat string))
 
@@ -207,8 +208,10 @@ STATUS is the status of the test (usually 'run)."
   (interactive)
   (let ((file (gotest-ui-get-file-for-visit))
         (line (gotest-ui-get-line-for-visit)))
+    (unless file
+      (error "No file reference at point"))
     (unless (file-exists-p file)
-      (error "Could not open %s:%d" file line))
+      (error "Could not open %s%s" file (if line (format ":%d" line) "")))
     (with-current-buffer (find-file-other-window file)
       (goto-char (point-min))
       (when line
@@ -220,40 +223,92 @@ STATUS is the status of the test (usually 'run)."
 
 (defun gotest-ui-get-line-for-visit ()
   "Return the line number from a go file reference."
-  (string-to-number (get-text-property (point) 'gotest-ui-line)))
+  (let ((line-str (get-text-property (point) 'gotest-ui-line)))
+    (if line-str
+        (string-to-number line-str)
+      nil)))
 
-(defun gotest-ui-file-from-gopath (package file-basename)
-  "Return an expanded file name for reaching FILE-BASENAME in go pkg PACKAGE."
+(defun gotest-ui-get-module-name (dir)
+  "Get the module name from go.mod in DIR."
+  (let ((go-mod-path (expand-file-name "go.mod" dir)))
+    (when (file-exists-p go-mod-path)
+      (with-temp-buffer
+        (insert-file-contents go-mod-path)
+        (goto-char (point-min))
+        (when (re-search-forward "^module \\(.+\\)$" nil t)
+          (string-trim (match-string 1)))))))
+
+(defun gotest-ui-find-file-in-project (file-basename dir)
+  "Search for FILE-BASENAME anywhere under DIR."
+  (let* ((default-directory dir)
+         (found-files (split-string
+                      (shell-command-to-string
+                       (format "find %s -name %s -type f 2>/dev/null | head -1"
+                               (shell-quote-argument dir)
+                               (shell-quote-argument file-basename)))
+                      "\n" t)))
+    (when found-files
+      (car found-files))))
+
+(defun gotest-ui-file-from-gopath (package file-basename dir)
+  "Return an expanded file name for reaching FILE-BASENAME in go pkg PACKAGE.
+DIR is the directory where tests are running."
   (if (or (file-name-absolute-p file-basename)
           (string-match-p "/" file-basename))
       file-basename
-    (let ((gopath (or (getenv "GOPATH")
-                      (expand-file-name "~/go"))))
-      (expand-file-name (concat gopath "/src/" package "/" file-basename)))))
+    ;; For Go modules: try resolving using package path
+    (let* ((module-name (gotest-ui-get-module-name dir))
+           (module-path (when (and module-name
+                                   (> (length package) 0)
+                                   (string-prefix-p module-name package))
+                          ;; Strip module name to get relative path
+                          (let* ((suffix-start (min (length package) (1+ (length module-name))))
+                                 (rel-path (if (< suffix-start (length package))
+                                              (substring package suffix-start)
+                                            "")))
+                            (if (> (length rel-path) 0)
+                                (expand-file-name (concat rel-path "/" file-basename) dir)
+                              (expand-file-name file-basename dir))))))
+      (if (and module-path (file-exists-p module-path))
+          module-path
+        ;; Try finding the file anywhere in the project
+        (let ((found-path (gotest-ui-find-file-in-project file-basename dir)))
+          (if found-path
+              found-path
+            ;; Fall back to GOPATH for backwards compatibility
+            (let* ((gopath (or (getenv "GOPATH")
+                               (expand-file-name "~/go")))
+                   (gopath-path (expand-file-name (concat gopath "/src/" package "/" file-basename))))
+              gopath-path)))))))
 
 (defvar gotest-ui-click-map
   (let ((map (make-sparse-keymap)))
     (define-key map [mouse-2] 'gotest-ui-mouse-open-file)
     map))
 
-(defun gotest-ui-ensure-parsed (thing)
-  "Parse the output in THING and ensure that .go file references are link-ified."
+(defun gotest-ui-ensure-parsed (thing dir)
+  "Parse the output in THING and ensure that .go file references are link-ified.
+DIR is the directory where tests are running."
   (save-excursion
     (goto-char gotest-ui-parse-marker)
     (while (re-search-forward "\\([^ \t]+\\.go\\):\\([0-9]+\\)" gotest-ui-insertion-marker t)
       (let* ((file-basename (match-string 1))
-             (file (gotest-ui-file-from-gopath (gotest-ui-test-package thing) file-basename)))
-        (set-text-properties (match-beginning 0) (match-end 0)
+             (line-num (match-string 2))
+             (match-start (match-beginning 0))
+             (match-end-pos (match-end 0))
+             (file (gotest-ui-file-from-gopath (gotest-ui-test-package thing) file-basename dir)))
+        (set-text-properties match-start match-end-pos
                              `(face gotest-ui-link-face
                                     gotest-ui-file ,file
-                                    gotest-ui-line ,(match-string 2)
+                                    gotest-ui-line ,line-num
                                     keymap ,gotest-ui-click-map
                                     follow-link t
                                     ))))
     (set-marker gotest-ui-parse-marker gotest-ui-insertion-marker)))
 
-(defun gotest-ui-update-thing-output (thing output)
-  "Update the THING (a test result), with OUTPUT."
+(defun gotest-ui-update-thing-output (thing output dir)
+  "Update the THING (a test result), with OUTPUT.
+DIR is the directory where tests are running."
   (with-current-buffer (gotest-ui-ensure-output-buffer thing)
     (goto-char gotest-ui-insertion-marker)
     (let ((overwrites (split-string output "\r")))
@@ -264,7 +319,7 @@ STATUS is the status of the test (usually 'run)."
           (delete-region (point) delete-to))
         (insert segment)))
     (set-marker gotest-ui-insertion-marker (point))
-    (gotest-ui-ensure-parsed thing)))
+    (gotest-ui-ensure-parsed thing dir)))
 
 ;; TODO: clean up buffers on kill
 
@@ -437,8 +492,10 @@ programmatic use.  The interactive functions
 (defun gotest-ui--pp-test-output (test)
   "Return the output for TEST as a propertized string."
   (with-current-buffer (gotest-ui-ensure-output-buffer test)
-    (propertize (buffer-substring (point-min) (point-max))
-                'line-prefix "\t")))
+    (let ((output (buffer-substring (point-min) (point-max))))
+      ;; Add line-prefix property while preserving existing properties
+      (add-text-properties 0 (length output) '(line-prefix "\t") output)
+      output)))
 
 (defun gotest-ui--pp-test (test)
   "Pretty-print TEST into the current buffer."
@@ -557,7 +614,7 @@ Update UI-BUFFER with the error messages."
               (forward-line 1)
               (set-marker (process-mark proc) (point))
               (with-current-buffer ui-buffer
-                (gotest-ui-update-thing-output test (concat line "\n"))
+                (gotest-ui-update-thing-output test (concat line "\n") gotest-ui--dir)
                 (ewoc-invalidate gotest-ui--ewoc (gotest-ui-thing-node test)))))))
          (t
           (let ((test (gotest-ui-read-failing-package ui-buffer)))
@@ -645,7 +702,7 @@ expression was read."
       (cl-case action
         (run
          (gotest-ui-sort-test-into-section test nil))
-        (output (gotest-ui-update-thing-output test .Output))
+        (output (gotest-ui-update-thing-output test .Output gotest-ui--dir))
         (pass
          (setf (gotest-ui-thing-status test) 'pass
                (gotest-ui-thing-elapsed test) .Elapsed)
