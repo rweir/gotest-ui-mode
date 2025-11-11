@@ -332,6 +332,8 @@ DIR is the directory where tests are running."
     (define-key m (kbd "TAB") 'gotest-ui-toggle-expanded)
     (define-key m (kbd "g") 'gotest-ui-rerun)
     (define-key m (kbd "RET") 'gotest-ui-open-file-at-point)
+    (define-key m (kbd "n") 'gotest-ui-next-file-reference)
+    (define-key m (kbd "p") 'gotest-ui-previous-file-reference)
     m))
 
 (define-derived-mode gotest-ui-mode special-mode "go test UI"
@@ -441,6 +443,64 @@ that it indicates."
       (setf (gotest-ui-thing-expanded-p data)
             (not (gotest-ui-thing-expanded-p data)))
       (ewoc-invalidate gotest-ui--ewoc node))))
+
+(defun gotest-ui-next-file-reference ()
+  "Move to the next file reference in the buffer."
+  (interactive)
+  (let ((start-pos (point))
+        (found nil))
+    ;; If we're on a file reference, skip past it first
+    (when (get-text-property (point) 'gotest-ui-file)
+      (while (and (< (point) (point-max))
+                  (get-text-property (point) 'gotest-ui-file))
+        (forward-char 1)))
+    ;; Now search forward for the next file reference
+    (while (and (< (point) (point-max)) (not found))
+      (when (get-text-property (point) 'gotest-ui-file)
+        (setq found (point)))
+      (unless found
+        (forward-char 1)))
+    (if found
+        (goto-char found)
+      ;; No more references found, wrap to beginning
+      (goto-char (point-min))
+      (setq found nil)
+      (while (and (< (point) (point-max)) (not found))
+        (when (get-text-property (point) 'gotest-ui-file)
+          (setq found (point)))
+        (unless found
+          (forward-char 1)))
+      (if found
+          (progn
+            (goto-char found)
+            (message "Wrapped to beginning"))
+        (goto-char start-pos)
+        (message "No file references found")))))
+
+(defun gotest-ui-previous-file-reference ()
+  "Move to the previous file reference in the buffer."
+  (interactive)
+  (let ((start-pos (point))
+        (found nil))
+    ;; Search backwards for a position with gotest-ui-file property
+    (save-excursion
+      (while (and (> (point) (point-min)) (not found))
+        (backward-char 1)
+        (when (get-text-property (point) 'gotest-ui-file)
+          (setq found (point)))))
+    (if found
+        (goto-char found)
+      ;; No previous references, wrap to end
+      (goto-char (point-max))
+      (while (and (> (point) (point-min)) (not found))
+        (backward-char 1)
+        (when (get-text-property (point) 'gotest-ui-file)
+          (setq found (point))))
+      (if found
+          (progn
+            (goto-char found)
+            (message "Wrapped to end"))
+        (message "No file references found")))))
 
 (defun gotest-ui-rerun ()
   "Re-run the `go test` run being displayed in the current buffer."
